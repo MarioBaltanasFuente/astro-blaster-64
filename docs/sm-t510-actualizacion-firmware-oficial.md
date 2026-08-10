@@ -49,14 +49,21 @@ soportado: las herramientas de flasheo escriben el conjunto completo, no increme
 
 ### Descarga
 
-En macOS lo más limpio es `samfirm.js`, que descarga directamente de los servidores FUS de Samsung y desencripta
-el `.enc4`:
+Descarga web desde samfw.com, sammobile.com o samfrew.com buscando `SM-T510` región `PHE`.
 
-```sh
-npx samfirm -m SM-T510 -r PHE
+`samfirm.js` (`npx samfirm -m SM-T510 -r PHE`) **consulta** correctamente la versión disponible, lo cual es útil
+para confirmar cuál es la última build, pero **la descarga falla**: la versión 0.2.0 (2021) muere en la rotación de
+autenticación con `ERR_OSSL_BAD_DECRYPT` / `Provider routines::bad decrypt`. No se arregla con
+`NODE_OPTIONS=--openssl-legacy-provider` — el problema no es un algoritmo obsoleto, sino el flujo de autenticación
+de los servidores FUS. Sirve como verificador de versión, no como descargador:
+
+```console
+$ npx samfirm -m SM-T510 -r PHE
+  Latest version:
+    PDA: T510XXU5CWA1
+    CSC: T510OXM5CVG2
+    MODEM: N/A          ← confirma que no hay CP: el T510 es solo WiFi
 ```
-
-Alternativa: samfw.com, sammobile.com o samfrew.com buscando `SM-T510` región `PHE`.
 
 Verificaciones obligatorias antes de flashear nada:
 
@@ -96,20 +103,36 @@ aparecerá el asistente de configuración, que **pedirá la cuenta Google del FR
 
 ## 4. Procedimiento de flasheo
 
-Conviene decirlo sin rodeos: **Odin es solo Windows y en un Mac Apple Silicon no hay ruta cómoda.** Una VM de
-Windows ARM (Parallels, UTM) ejecuta el `.exe` por emulación, pero el **driver USB de Samsung es un driver de
-kernel x86 sin versión ARM64**, así que Odin nunca verá el dispositivo. Esa vía está descartada.
+Conviene decirlo sin rodeos: **desde un Mac Apple Silicon no se puede flashear este dispositivo.** No es una
+cuestión de dificultad, sino de que ninguna de las herramientas disponibles implementa la conexión USB en macOS.
+
+- **Odin** es solo Windows. Una VM de Windows ARM (Parallels, UTM) ejecuta el `.exe` por emulación, pero el
+  **driver USB de Samsung es un driver de kernel x86 sin versión ARM64**, así que Odin nunca verá el dispositivo.
+- **Thor** publica un binario `Thor-MacOS` que arranca sin problemas, pero su README declara
+  `Mac OS (not implemented)` y solo soporta `Linux (USB DevFS method)`. En la práctica, `connect` intenta abrir
+  `/dev/bus/usb` —ruta inexistente en macOS— y aborta con `Could not find a part of the path '/dev/bus/usb'`.
+  **Verificado en un Mac mini Apple Silicon con Thor 1.1.0.**
+- **Heimdall** sí es nativo de macOS, pero su último desarrollo real es de 2017: no maneja particiones dinámicas
+  (`super`) ni las imágenes sparse que usa el firmware Android 11 de este modelo. Probabilidad de éxito
+  prácticamente nula.
+
+El Mac sirve para **descargar y verificar** el firmware. Para escribirlo hace falta otra máquina.
+
+Comprobación previa útil desde macOS: con la tablet en Download Mode, `ls /dev/cu.*` debe mostrar un
+`/dev/cu.usbmodem…`. Eso confirma que el cable es de datos y que el dispositivo enumera correctamente, algo que
+ahorra tiempo de diagnóstico al pasar al equipo de flasheo.
 
 ### Antes de empezar
 
 - Batería de la tablet ≥ 60 % (en bootloop puede haberse descargado; déjala cargando un par de horas).
 - Credenciales de la cuenta Google del FRP a mano.
 - Firmware descargado, descomprimido y con MD5 verificado.
-- Mac conectado a corriente y con el reposo desactivado.
+- Equipo de flasheo conectado a corriente y con la suspensión desactivada.
 
-### Opción A — recomendada: PC Windows x86
+### Opción A — PC Windows x86 con Odin
 
-La de menor riesgo de brick. Tratándose de escribir el **bootloader**, ese criterio manda sobre la comodidad.
+La de menor riesgo de brick, y en la práctica la única recomendable. Tratándose de escribir el **bootloader**, ese
+criterio manda sobre la comodidad.
 
 1. Instalar **Samsung USB Driver for Mobile Phones** (v1.7.x) y reiniciar.
 2. Usar **Odin3 v3.14.4** (o 3.13.3) original, nunca versiones "mod".
@@ -119,48 +142,40 @@ La de menor riesgo de brick. Tratándose de escribir el **bootloader**, ese crit
 6. `Start`. El AP tarda varios minutos (~2,5 GB). **No desconectar bajo ningún concepto.**
 7. Esperar `PASS!` y el reinicio. El primer arranque puede tardar hasta 15 minutos: es normal.
 
-### Opción B — nativa en macOS: Thor
+### Opción B — PC Linux x86_64 con Thor u `odin4`
 
-[`Samsung-Loki/Thor`](https://github.com/Samsung-Loki/Thor) es un flasher open source en .NET que reimplementa el
-protocolo Odin y publica binarios para macOS. Usa libusb en espacio de usuario, así que no necesita kexts (que
-macOS reciente bloquearía). Es la única vía nativa razonable hoy en Apple Silicon.
-
-Heimdall queda como último recurso: está prácticamente sin mantenimiento, no digiere `.tar.md5` directamente y
-falla con frecuencia en dispositivos de esta generación con Secure Download activo.
+Válida si se dispone de una máquina Linux **física**. `Thor-Linux` (release 1.1.0) usa el método USB DevFS y
+funciona; `odin4` es el flasher CLI oficial de Samsung para Linux y también sirve. Ambos son binarios x86_64.
 
 ```sh
-brew install libusb                       # dependencia de LibUsbDotNet
-# descargar el release osx-arm64 de Thor y retirar la cuarentena de Gatekeeper:
-xattr -dr com.apple.quarantine ./TheAirBlow.Thor.Shell
-./TheAirBlow.Thor.Shell
+sudo ./Thor-Linux
 ```
 
-En la shell interactiva de Thor:
+Se ejecuta como root, o se añade una regla udev para el vendor ID de Samsung:
 
 ```
-connect                 # detecta la tablet en Download Mode
-begin odin              # inicia la sesión de protocolo Odin
-flashTar                # seleccionar BL, AP y CSC_OXM  (NO HOME_CSC, NO CP)
-                        # dejar sin marcar cualquier opción de repartición
-end                     # cierra la sesión y reinicia
+SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", MODE="0666", GROUP="<tu-grupo>"
 ```
 
-Precauciones específicas de esta vía:
+Puede hacer falta descargar el módulo `cdc_acm`, que se apropia del puerto serie del dispositivo:
 
-- Conectar la tablet **directamente al puerto USB-C del Mac** con un cable **de datos**; muchos cables USB-C son
-  solo de carga. Sin hubs, sin docks, sin adaptadores intermedios.
-- Impedir el reposo del Mac durante todo el proceso (`caffeinate -i` en otra terminal). Que el Mac suspenda a mitad
-  de la escritura del bootloader es el peor escenario posible.
-- Si `connect` no detecta nada, revisar el cable antes que cualquier otra cosa: en
-  *Información del Sistema → USB* debe aparecer un dispositivo Samsung mientras la tablet está en Download Mode.
-- Thor no es Odin. El riesgo de escritura parcial es estructuralmente mayor; si hay un PC disponible, mejor la
-  opción A.
+```sh
+sudo modprobe -r cdc_acm
+```
 
-### Opción C — Linux con `odin4`
+Dentro de la shell de Thor: `connect` → `begin odin` → `flashTar` (seleccionar BL, AP y CSC_OXM; **no** HOME_CSC,
+**no** CP; sin repartición) → `end`.
 
-`odin4` es el flasher CLI oficial de Samsung para Linux, pero es un binario **x86_64**. En Apple Silicon exige una
-VM Linux con emulación y passthrough USB. Funciona, pero es la configuración más frágil de las tres. Solo si A y B
-fallan.
+Limitación conocida: tras cerrar una sesión Odin no se puede reutilizar la misma conexión USB. Para reintentar hay
+que reiniciar la máquina.
+
+### No usar: VM Linux sobre Apple Silicon
+
+Tentador, pero es la peor idea de la lista. `Thor-Linux` y `odin4` son x86_64, así que en Apple Silicon exigen
+emulación completa, y el passthrough USB a través de esa capa es inestable. El propio README de Thor advierte de
+forma explícita: *"Do not use the Linux version under WSL or under a badly configured VM"*. Una escritura de
+bootloader de ~2,5 GB sobre un enlace USB emulado es exactamente el escenario que produce un brick irrecuperable.
+Si no hay máquina física disponible, es preferible esperar a tenerla.
 
 ## 5. Riesgos de subir de binario
 
