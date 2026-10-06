@@ -1,0 +1,163 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""ask: consulta el modelo local (Qwen) o DeepSeek. redact: filtra datos sensibles.
+
+  ask "pregunta"          modelo local, sin razonamiento
+  ask -t "pregunta"       modelo local, con razonamiento
+  ask -d "pregunta"       DeepSeek, con filtro de datos sensibles
+  ask -D "pregunta"       DeepSeek, SIN filtro
+  cat f | ask -d "..."    el texto de la tubería se añade a la pregunta
+  cat f | redact          muestra el texto filtrado (no envía nada)
+  cat f | redact -v       además lista qué se ha ocultado
+
+Con -d, lo ocultado se sustituye por marcadores ([IP_1], [EMAIL_2]...) antes de
+enviarlo; en la respuesta se vuelven a poner los valores reales, solo en tu pantalla.
+"""
+import os, re, sys, json, urllib.request, urllib.error
+
+LOCAL_URL = "http://127.0.0.1:8080/v1/chat/completions"
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
+
+# Parámetros oficiales de Qwen3.5 para cada modo
+NO_THINK = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "chat_template_kwargs": {"enable_thinking": False}}
+THINK    = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "chat_template_kwargs": {"enable_thinking": True}}
+
+# ---------------------------------------------------------------- filtro
+
+def _luhn(s):
+    d = [int(c) for c in s if c.isdigit()]
+    if not 13 <= len(d) <= 19:
+        return False
+    total = 0
+    for i, n in enumerate(reversed(d)):
+        if i % 2:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+def _dni_ok(s):
+    s = s.upper()
+    num = s[:-1].replace("X", "0").replace("Y", "1").replace("Z", "2")
+    return "TRWAGMYFPDXBNJZSQVHLCKE"[int(num) % 23] == s[-1]
+
+HEX = r"[0-9A-Fa-f]{1,4}"
+
+# (etiqueta, patrón, grupo a ocultar, validador opcional). El orden importa.
+RULES = [
+    ("CLAVE_PRIVADA", r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----", 0, None),
+    ("CREDENCIAL", r"(?<=://)[^\s:/@]+:[^\s@/]+(?=@)", 0, None),
+    ("TOKEN", r"\beyJ[\w-]+\.[\w-]+\.[\w-]+", 0, None),
+    ("TOKEN", r"\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}"
+              r"|glpat-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|hf_[A-Za-z0-9]{30,}"
+              r"|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35})", 0, None),
+    ("TOKEN", r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})", 1, None),
+    ("SECRETO", r"(?i)\b(?:pass(?:word|wd)?|pwd|contrase(?:ñ|n)a|clave|secret|token|api[_-]?key"
+                r"|access[_-]?key|private[_-]?key|client[_-]?secret|auth(?:orization)?)\b[\"']?\s*[:=]\s*[\"']?"
+                r"(?!(?:bearer|basic)\b)(?!\[)([^\s\"',;]{3,})", 1, None),
+    ("IBAN", r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b", 0, None),
+    ("TARJETA", r"(?<![\d-])\d(?:[ -]?\d){12,18}(?![\d-])", 0, _luhn),
+    ("EMAIL", r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b", 0, None),
+    ("MAC", r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b", 0, None),
+    ("IP", rf"(?<![\w:])(?:(?:{HEX}:){{7}}{HEX}|(?:{HEX}:){{1,6}}:(?:{HEX}(?::{HEX})*)?|::{HEX}(?::{HEX})*)(?![\w:])", 0, None),
+    ("IP", r"(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d|\.\d)", 0, None),
+    ("DNI", r"\b(?:\d{8}|[XYZ]\d{7})[A-HJ-NP-TV-Z]\b", 0, _dni_ok),
+    ("TELEFONO", r"(?<![\w+])(?:\+34[ -]?)?(?:[6789]\d{2}(?:[ -]?\d{3}[ -]?\d{3}|(?: \d{2}){3})|[89]\d \d{3}(?: \d{2}){2})(?!\d)", 0, None),
+    ("TELEFONO", r"(?<![\w+])\+\d{1,3}[ -]?\d{6,12}(?!\d)", 0, None),
+]
+RULES = [(lab, re.compile(p), g, v) for lab, p, g, v in RULES]
+
+def redact(text):
+    """Devuelve (texto_filtrado, {marcador: original})."""
+    seen, back, count = {}, {}, {}
+
+    def mark(label, value):
+        key = (label, value)
+        if key not in seen:
+            count[label] = count.get(label, 0) + 1
+            seen[key] = f"[{label}_{count[label]}]"
+            back[seen[key]] = value
+        return seen[key]
+
+    for label, rx, g, valid in RULES:
+        def sub(m):
+            value = m.group(g)
+            if valid and not valid(value):
+                return m.group(0)
+            s, e = m.start(g) - m.start(0), m.end(g) - m.start(0)
+            whole = m.group(0)
+            return whole[:s] + mark(label, value) + whole[e:]
+        text = rx.sub(sub, text)
+    return text, back
+
+def restore(text, back):
+    for ph in sorted(back, key=len, reverse=True):
+        text = text.replace(ph, back[ph])
+    return text
+
+# ---------------------------------------------------------------- consulta
+
+def post(url, key, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Error HTTP {e.code}: {e.read().decode()[:500]}")
+    except urllib.error.URLError as e:
+        hint = " ¿Has ejecutado qwen-start?" if url == LOCAL_URL else ""
+        sys.exit(f"No conecta ({e.reason}).{hint}")
+
+def read_input(args):
+    prompt = " ".join(args)
+    if not sys.stdin.isatty():
+        prompt = (prompt + "\n\n" + sys.stdin.read()).strip()
+    return prompt
+
+def main_redact(args):
+    text, back = redact(read_input([a for a in args if a != "-v"]))
+    print(text)
+    if "-v" in args:
+        for ph, orig in back.items():
+            print(f"  {ph} <- {orig}", file=sys.stderr)
+    print(f"[filtro: {len(back)} datos ocultados]", file=sys.stderr)
+
+def main_ask(args):
+    flag = args.pop(0) if args and args[0] in ("-t", "-d", "-D") else None
+    prompt = read_input(args)
+    if not prompt:
+        sys.exit(__doc__)
+
+    if flag in ("-d", "-D"):
+        key = os.environ.get("DEEPSEEK_API_KEY")
+        if not key:
+            sys.exit("Falta DEEPSEEK_API_KEY en ~/.bashrc")
+        back = {}
+        if flag == "-d":
+            prompt, back = redact(prompt)
+            print(f"[filtro: {len(back)} datos ocultados antes de enviar]", file=sys.stderr)
+        d = post(DEEPSEEK_URL, key, {"model": DEEPSEEK_MODEL,
+                                     "messages": [{"role": "user", "content": prompt}]})
+        print(restore(d["choices"][0]["message"]["content"], back))
+        return
+
+    opts = THINK if flag == "-t" else NO_THINK
+    d = post(LOCAL_URL, "local", {"model": "local",
+                                  "messages": [{"role": "user", "content": prompt}], **opts})
+    print(d["choices"][0]["message"]["content"])
+    t = d.get("timings")
+    if t:
+        print(f"\n[lectura {t['prompt_per_second']:.1f} t/s | generación "
+              f"{t['predicted_per_second']:.1f} t/s | {t['predicted_n']} tokens]", file=sys.stderr)
+
+if __name__ == "__main__":
+    if os.path.basename(sys.argv[0]) == "redact":
+        main_redact(sys.argv[1:])
+    else:
+        main_ask(sys.argv[1:])
