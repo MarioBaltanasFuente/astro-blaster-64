@@ -11,6 +11,7 @@
 #   all    diag + build + bench + apply
 #
 # Variables opcionales: MODEL=ruta.gguf  ARCH=armv8.6-a+dotprod+i8mm  JOBS=4  THREADS=2,3,4,5,6,8
+#   PIN=1  añade a bench la prueba fijada a núcleos rápidos (taskset)
 
 set -u
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
@@ -197,7 +198,7 @@ bench() {
   fi
   run_bench "$BIN/llama-bench" "$THREADS" compilado
   big="$(big_cores)"
-  if [ -n "$big" ] && command -v taskset > /dev/null; then
+  if [ "${PIN:-0}" = 1 ] && [ -n "$big" ] && command -v taskset > /dev/null; then
     n=$(echo "$big" | tr ',' '\n' | wc -l)
     run_bench "$BIN/llama-bench" "$n" fijado taskset -c "$big"
   fi
@@ -252,7 +253,7 @@ EOF
 cmd="${1:-}"
 case "$cmd" in
   diag|build|bench|quick|apply|all) ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 
 {
