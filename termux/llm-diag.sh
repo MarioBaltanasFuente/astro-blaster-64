@@ -50,7 +50,7 @@ big_cores() {
 sysinfo() {
   local b="$1" l="$OUT/sysinfo.log" s pid
   [ -x "$b" ] && [ -f "$MODEL" ] || return 0
-  "$b" -m "$MODEL" -c 256 --port 8099 --host 127.0.0.1 > "$l" 2>&1 &
+  "$b" -m "$MODEL" -c 256 -lv 4 --port 8099 --host 127.0.0.1 > "$l" 2>&1 &
   pid=$!
   for _ in $(seq 1 30); do grep -q system_info "$l" && break; sleep 1; done
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
@@ -236,7 +236,7 @@ apply() {
 pgrep -f llama-server > /dev/null && { echo "Ya está en marcha."; exit 0; }
 termux-wake-lock
 ${pre}$BIN/llama-server -m $MODEL \\
-  --jinja -c 8192 -t $T -tb $TB --port 8080 --host 127.0.0.1 \\
+  --jinja -c 8192 -np 1 -t $T -tb $TB --port 8080 --host 127.0.0.1 \\
   > ~/llama.log 2>&1 &
 echo "Cargando modelo... (log: ~/llama.log)"
 until curl -s 127.0.0.1:8080/health | grep -q ok; do
